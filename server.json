@@ -1,0 +1,19 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/server.json",
+  "schemaVersion": "2025-12-11",
+  "id": "io.github.striderlabs/marriott",
+  "name": "Strider Marriott MCP",
+  "description": "MCP server for Marriott Hotels — search hotels, manage reservations, check in, track Bonvoy points, and redeem rewards via browser automation.",
+  "version": "0.1.0",
+  "package": {
+    "name": "@striderlabs/mcp-marriott",
+    "registry": "npm"
+  },
+  "transports": [
+    {
+      "type": "stdio",
+      "command": "node",
+      "args": ["dist/index.js"]
+    }
+  ]
+}
