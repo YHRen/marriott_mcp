@@ -1,16 +1,17 @@
 {
-  "name": "@striderlabs/mcp-marriott",
+  "name": "@YHRen/mcp-marriott",
   "version": "0.1.0",
   "description": "MCP server for Marriott Hotels — let AI agents search hotels, manage reservations, check in, and redeem Bonvoy points via browser automation",
   "main": "dist/index.js",
   "bin": {
-    "striderlabs-mcp-marriott": "dist/index.js"
+    "mcp-marriott": "dist/index.js"
   },
   "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "prepublishOnly": "npm run build"
+    "test": "vitest run",
+    "prepare": "npm run build"
   },
   "keywords": [
     "mcp",
@@ -34,7 +35,7 @@
     "zod": "^4.5.4"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
+    "@types/node": "^22.20.1",
     "typescript": "^5.3.3",
     "vite": "^8.2.2",
     "vitest": "^5.0.0"

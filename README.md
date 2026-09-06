@@ -161,6 +161,11 @@ node dist/index.js
 
 
 
+## Legal Disclaimer
+
+> **⚠️ IMPORTANT:** This software automates interactions with Marriott.com. It is not affiliated with, endorsed by, or sponsored by Marriott International, Inc.
+> Using this tool to automate bookings or scrape data may violate Marriott's Terms of Service. This software is provided for educational purposes only. Use at your own risk. The authors are not responsible for any account bans, cancellations, or financial losses incurred through the use of this tool.
+
 ## License
 
 MIT — [Strider Labs](https://striderlabs.ai)
