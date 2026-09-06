@@ -58,16 +58,9 @@ npx @striderlabs/mcp-marriott
 npx playwright install chromium
 ```
 
-### 3. Configure credentials (optional)
+### 3. Login
 
-Set environment variables for automatic login:
-
-```bash
-export MARRIOTT_EMAIL="your@email.com"
-export MARRIOTT_PASSWORD="yourpassword"
-```
-
-Without these, the `login` tool returns a URL for manual browser login.
+This server uses secure, encrypted storage for your session. To log in, use the `login` tool provided by the server. It will provide a secure login URL where you can enter your credentials manually in your browser.
 
 ### 4. Configure Claude Desktop
 
@@ -78,11 +71,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "marriott": {
       "command": "npx",
-      "args": ["@striderlabs/mcp-marriott"],
-      "env": {
-        "MARRIOTT_EMAIL": "your@email.com",
-        "MARRIOTT_PASSWORD": "yourpassword"
-      }
+      "args": ["@striderlabs/mcp-marriott"]
     }
   }
 }
@@ -96,11 +85,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
     "servers": {
       "marriott": {
         "command": "npx",
-        "args": ["@striderlabs/mcp-marriott"],
-        "env": {
-          "MARRIOTT_EMAIL": "your@email.com",
-          "MARRIOTT_PASSWORD": "yourpassword"
-        }
+        "args": ["@striderlabs/mcp-marriott"]
       }
     }
   }
@@ -174,12 +159,7 @@ npm run build
 node dist/index.js
 ```
 
-## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `MARRIOTT_EMAIL` | Marriott Bonvoy account email |
-| `MARRIOTT_PASSWORD` | Marriott Bonvoy account password |
 
 ## License
 
