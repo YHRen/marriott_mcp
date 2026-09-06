@@ -15,6 +15,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { ZodError } from "zod";
 
 import {
   checkLoginStatus,
@@ -34,7 +35,52 @@ import {
   getStayHistory,
   closeBrowser,
 } from "./browser.js";
-import { loadSessionInfo, clearAuthData, getConfigDir } from "./auth.js";
+import { loadSessionInfo, clearAuthData } from "./secure-store.js";
+import {
+  createConfirmationToken,
+  validateConfirmationToken,
+  clearPendingConfirmations,
+} from "./confirmation.js";
+import {
+  SearchHotelsSchema,
+  HotelDetailsSchema,
+  RoomOptionsSchema,
+  SelectRoomSchema,
+  AddExtrasSchema,
+  CheckoutSchema,
+  GetReservationSchema,
+  ModifyReservationSchema,
+  CancelReservationSchema,
+  CheckInSchema,
+  RedeemPointsSchema,
+  StayHistorySchema,
+} from "./validation.js";
+
+/**
+ * Sanitize error messages to prevent information leakage.
+ * Strips URLs (which may contain tokens) and maps known errors
+ * to user-friendly messages.
+ */
+function sanitizeError(error: unknown): string {
+  if (error instanceof ZodError) {
+    const issues = error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);
+    return `Invalid input: ${issues.join("; ")}`;
+  }
+
+  const msg = error instanceof Error ? error.message : String(error);
+
+  // Strip URLs that might contain session tokens or internal paths
+  const sanitized = msg.replace(/https?:\/\/[^\s]+/g, "[URL redacted]");
+
+  // Map known Playwright / network errors to friendly messages
+  if (msg.includes("net::ERR_")) return "Network error. Please try again.";
+  if (msg.includes("Timeout") || msg.includes("timeout"))
+    return "The page took too long to load. Please try again.";
+  if (msg.toLowerCase().includes("captcha"))
+    return "CAPTCHA detected. Try again later or log in manually.";
+
+  return sanitized;
+}
 
 // Initialize server
 const server = new Server(
@@ -457,7 +503,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   success: true,
                   session: liveStatus,
                   savedSession: sessionInfo,
-                  configDir: getConfigDir(),
                   message: liveStatus.isLoggedIn
                     ? `Logged in${
                         liveStatus.userName
@@ -498,6 +543,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "logout": {
         clearAuthData();
+        clearPendingConfirmations();
         await closeBrowser();
 
         return {
@@ -514,6 +560,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "search_hotels": {
+        const validated = SearchHotelsSchema.parse(args);
         const {
           destination,
           checkIn,
@@ -522,15 +569,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           children,
           rooms,
           maxResults = 10,
-        } = args as {
-          destination: string;
-          checkIn: string;
-          checkOut: string;
-          adults?: number;
-          children?: number;
-          rooms?: number;
-          maxResults?: number;
-        };
+        } = validated;
 
         const hotels = await searchHotels({
           destination,
@@ -564,7 +603,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_hotel_details": {
-        const { hotelIdOrUrl } = args as { hotelIdOrUrl: string };
+        const { hotelIdOrUrl } = HotelDetailsSchema.parse(args);
         const details = await getHotelDetails(hotelIdOrUrl);
 
         return {
@@ -592,14 +631,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           adults,
           children,
           usePoints,
-        } = args as {
-          hotelId: string;
-          checkIn: string;
-          checkOut: string;
-          adults?: number;
-          children?: number;
-          usePoints?: boolean;
-        };
+        } = RoomOptionsSchema.parse(args);
 
         const rooms = await getRoomOptions({
           hotelId,
@@ -633,11 +665,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "select_room": {
-        const { hotelId, roomCode, ratePlanCode } = args as {
-          hotelId: string;
-          roomCode: string;
-          ratePlanCode?: string;
-        };
+        const { hotelId, roomCode, ratePlanCode } = SelectRoomSchema.parse(args);
 
         const result = await selectRoom({ hotelId, roomCode, ratePlanCode });
 
@@ -652,16 +680,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "add_extras": {
-        const { extras } = args as {
-          extras: Array<
-            | "parking"
-            | "breakfast"
-            | "late_checkout"
-            | "early_checkin"
-            | "airport_transfer"
-            | "spa_credit"
-          >;
-        };
+        const { extras } = AddExtrasSchema.parse(args);
 
         const result = await addExtras({ extras });
 
@@ -676,6 +695,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "checkout": {
+        const validated = CheckoutSchema.parse(args);
         const {
           hotelId,
           roomCode,
@@ -688,21 +708,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           email,
           phone,
           specialRequests,
-          confirm = false,
-        } = args as {
-          hotelId?: string;
-          roomCode?: string;
-          checkIn: string;
-          checkOut: string;
-          adults?: number;
-          children?: number;
-          firstName?: string;
-          lastName?: string;
-          email?: string;
-          phone?: string;
-          specialRequests?: string;
-          confirm?: boolean;
-        };
+          confirmationToken,
+        } = validated;
+
+        // If a confirmation token is provided, validate it and proceed
+        if (confirmationToken) {
+          validateConfirmationToken(confirmationToken, "checkout");
+        }
 
         const result = await checkout({
           hotelId,
@@ -716,10 +728,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           email,
           phone,
           specialRequests,
-          confirm,
+          confirm: !!confirmationToken,
         });
 
         if ("requiresConfirmation" in result) {
+          const token = createConfirmationToken("checkout", {
+            hotelId,
+            roomCode,
+            checkIn,
+            checkOut,
+          });
+
           return {
             content: [
               {
@@ -728,8 +747,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   {
                     success: true,
                     requiresConfirmation: result.requiresConfirmation,
+                    confirmationToken: token,
                     preview: result.preview,
-                    note: "Call checkout with confirm=true to complete the booking. IMPORTANT: Only do this after getting explicit user confirmation.",
+                    note: "Call checkout with the confirmationToken above to complete the booking. IMPORTANT: Only do this after getting explicit user confirmation. Token expires in 5 minutes.",
                   },
                   null,
                   2
@@ -758,7 +778,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_reservation": {
-        const { confirmationNumber } = (args as { confirmationNumber?: string }) || {};
+        const { confirmationNumber } = GetReservationSchema.parse(args || {});
         const reservations = await getReservation(confirmationNumber);
 
         return {
@@ -780,21 +800,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "modify_reservation": {
+        const validated = ModifyReservationSchema.parse(args);
         const {
           confirmationNumber,
           newCheckIn,
           newCheckOut,
           newRoomType,
           specialRequests,
-          confirm = false,
-        } = args as {
-          confirmationNumber: string;
-          newCheckIn?: string;
-          newCheckOut?: string;
-          newRoomType?: string;
-          specialRequests?: string;
-          confirm?: boolean;
-        };
+          confirmationToken,
+        } = validated;
+
+        if (confirmationToken) {
+          validateConfirmationToken(confirmationToken, "modify_reservation");
+        }
 
         const result = await modifyReservation({
           confirmationNumber,
@@ -802,10 +820,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           newCheckOut,
           newRoomType,
           specialRequests,
-          confirm,
+          confirm: !!confirmationToken,
         });
 
         if ("requiresConfirmation" in result) {
+          const token = createConfirmationToken("modify_reservation", {
+            confirmationNumber,
+            newCheckIn,
+            newCheckOut,
+          });
+
           return {
             content: [
               {
@@ -814,8 +838,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   {
                     success: true,
                     requiresConfirmation: result.requiresConfirmation,
+                    confirmationToken: token,
                     preview: result.preview,
-                    note: "Call modify_reservation with confirm=true to apply changes. IMPORTANT: Only do this after explicit user confirmation.",
+                    note: "Call modify_reservation with the confirmationToken above to apply changes. IMPORTANT: Only do this after explicit user confirmation. Token expires in 5 minutes.",
                   },
                   null,
                   2
@@ -836,14 +861,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "cancel_reservation": {
-        const { confirmationNumber, confirm = false } = args as {
-          confirmationNumber: string;
-          confirm?: boolean;
-        };
+        const { confirmationNumber, confirmationToken } = CancelReservationSchema.parse(args);
 
-        const result = await cancelReservation({ confirmationNumber, confirm });
+        if (confirmationToken) {
+          validateConfirmationToken(confirmationToken, "cancel_reservation");
+        }
+
+        const result = await cancelReservation({
+          confirmationNumber,
+          confirm: !!confirmationToken,
+        });
 
         if ("requiresConfirmation" in result) {
+          const token = createConfirmationToken("cancel_reservation", {
+            confirmationNumber,
+          });
+
           return {
             content: [
               {
@@ -852,8 +885,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   {
                     success: true,
                     requiresConfirmation: result.requiresConfirmation,
+                    confirmationToken: token,
                     preview: result.preview,
-                    note: "Call cancel_reservation with confirm=true to cancel. IMPORTANT: Only do this after explicit user confirmation. This cannot be undone.",
+                    note: "Call cancel_reservation with the confirmationToken above to cancel. IMPORTANT: Only do this after explicit user confirmation. This cannot be undone. Token expires in 5 minutes.",
                   },
                   null,
                   2
@@ -874,11 +908,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "check_in": {
-        const { confirmationNumber, estimatedArrivalTime, roomPreferences } = args as {
-          confirmationNumber: string;
-          estimatedArrivalTime?: string;
-          roomPreferences?: string;
-        };
+        const { confirmationNumber, estimatedArrivalTime, roomPreferences } =
+          CheckInSchema.parse(args);
 
         const result = await checkIn({
           confirmationNumber,
@@ -917,14 +948,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "redeem_points": {
-        const { hotelId, checkIn, checkOut, adults, roomCode, confirm = false } = args as {
-          hotelId: string;
-          checkIn: string;
-          checkOut: string;
-          adults?: number;
-          roomCode?: string;
-          confirm?: boolean;
-        };
+        const validated = RedeemPointsSchema.parse(args);
+        const { hotelId, checkIn, checkOut, adults, roomCode, confirmationToken } = validated;
+
+        if (confirmationToken) {
+          validateConfirmationToken(confirmationToken, "redeem_points");
+        }
 
         const result = await redeemPoints({
           hotelId,
@@ -932,10 +961,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           checkOut,
           adults,
           roomCode,
-          confirm,
+          confirm: !!confirmationToken,
         });
 
         if ("requiresConfirmation" in result) {
+          const token = createConfirmationToken("redeem_points", {
+            hotelId,
+            checkIn,
+            checkOut,
+          });
+
           return {
             content: [
               {
@@ -944,8 +979,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   {
                     success: true,
                     requiresConfirmation: result.requiresConfirmation,
+                    confirmationToken: token,
                     preview: result.preview,
-                    note: "Call redeem_points with confirm=true to complete redemption. IMPORTANT: Only do this after explicit user confirmation.",
+                    note: "Call redeem_points with the confirmationToken above to complete redemption. IMPORTANT: Only do this after explicit user confirmation. Token expires in 5 minutes.",
                   },
                   null,
                   2
@@ -966,7 +1002,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_stay_history": {
-        const { limit } = (args as { limit?: number }) || {};
+        const { limit } = StayHistorySchema.parse(args || {});
         const history = await getStayHistory({ limit });
 
         return {
@@ -1001,8 +1037,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
     }
   } catch (error) {
-    const errorMessage =
-      error instanceof Error ? error.message : String(error);
+    const errorMessage = sanitizeError(error);
 
     return {
       content: [
@@ -1017,10 +1052,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 errorMessage.toLowerCase().includes("auth") ||
                 errorMessage.toLowerCase().includes("signin")
                   ? "Use the login tool to authenticate, or set MARRIOTT_EMAIL and MARRIOTT_PASSWORD environment variables."
-                  : errorMessage.toLowerCase().includes("captcha")
-                  ? "CAPTCHA encountered. Try again in a moment or complete login manually."
-                  : errorMessage.toLowerCase().includes("timeout")
-                  ? "The page took too long to load. Try again."
+                  : errorMessage.toLowerCase().includes("invalid input")
+                  ? "Check the input parameters and try again."
                   : undefined,
             },
             null,
@@ -1043,7 +1076,6 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Strider Marriott MCP server running");
-  console.error(`Config directory: ${getConfigDir()}`);
 }
 
 main().catch((error) => {

@@ -9,8 +9,10 @@ import {
   saveCookies,
   loadCookies,
   saveSessionInfo,
+  getCredentials,
   type SessionInfo,
-} from "./auth.js";
+} from "./secure-store.js";
+import { BrowserMutex, withMutex } from "./mutex.js";
 
 const MARRIOTT_BASE_URL = "https://www.marriott.com";
 const DEFAULT_TIMEOUT = 30000;
@@ -24,6 +26,36 @@ let page: Page | null = null;
 let selectedHotelId: string | null = null;
 let selectedRoomCode: string | null = null;
 let selectedRatePlanCode: string | null = null;
+
+/** Mutex to serialize all browser operations */
+const browserMutex = new BrowserMutex();
+
+/**
+ * Validate that a URL is on marriott.com before navigating.
+ * Prevents SSRF and open redirect attacks from malicious tool inputs.
+ */
+function assertMarriottUrl(url: string): void {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:") {
+      throw new Error("Only HTTPS URLs are allowed");
+    }
+    if (
+      parsed.hostname !== "www.marriott.com" &&
+      parsed.hostname !== "marriott.com" &&
+      !parsed.hostname.endsWith(".marriott.com")
+    ) {
+      throw new Error(
+        `Navigation blocked: ${parsed.hostname} is not on marriott.com`
+      );
+    }
+  } catch (e) {
+    if (e instanceof TypeError) {
+      throw new Error("Invalid URL format");
+    }
+    throw e;
+  }
+}
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -162,13 +194,14 @@ async function initBrowser(): Promise<{
     headless: true,
     args: [
       "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-accelerated-2d-canvas",
       "--no-first-run",
-      "--no-zygote",
       "--disable-gpu",
+      // Only disable sandbox if explicitly opted in (e.g., for Docker)
+      ...(process.env.MARRIOTT_NO_SANDBOX === "true"
+        ? ["--no-sandbox", "--disable-setuid-sandbox", "--no-zygote"]
+        : []),
     ],
   });
 
@@ -200,6 +233,7 @@ async function initBrowser(): Promise<{
 }
 
 export async function closeBrowser(): Promise<void> {
+  return withMutex(browserMutex, async () => {
   if (page) {
     await page.close().catch(() => {});
     page = null;
@@ -212,6 +246,7 @@ export async function closeBrowser(): Promise<void> {
     await browser.close().catch(() => {});
     browser = null;
   }
+});
 }
 
 async function getPage(): Promise<Page> {
@@ -222,19 +257,22 @@ async function getPage(): Promise<Page> {
 // ─── Auth ──────────────────────────────────────────────────────────────────────
 
 export async function checkLoginStatus(): Promise<SessionInfo> {
+  return withMutex(browserMutex, async () => {
   const { context: ctx } = await initBrowser();
   const p = await getPage();
 
   try {
-    await p.goto(`${MARRIOTT_BASE_URL}/loyalty/myAccount/default.mi`, {
+    const url = `${MARRIOTT_BASE_URL}/loyalty/myAccount/default.mi`;
+    assertMarriottUrl(url);
+    await p.goto(url, {
       waitUntil: "domcontentloaded",
       timeout: DEFAULT_TIMEOUT,
     });
     await randomDelay(500, 1000);
 
     // Check if redirected to login page
-    const url = p.url();
-    if (url.includes("signin") || url.includes("login")) {
+    const currentUrl = p.url();
+    if (currentUrl.includes("signin") || currentUrl.includes("login")) {
       const info: SessionInfo = {
         isLoggedIn: false,
         lastUpdated: new Date().toISOString(),
@@ -282,6 +320,7 @@ export async function checkLoginStatus(): Promise<SessionInfo> {
       lastUpdated: new Date().toISOString(),
     };
   }
+});
 }
 
 export async function initiateLogin(): Promise<{
@@ -289,11 +328,11 @@ export async function initiateLogin(): Promise<{
   loginUrl: string;
   instructions: string;
 }> {
-  const email = process.env.MARRIOTT_EMAIL;
-  const password = process.env.MARRIOTT_PASSWORD;
+  return withMutex(browserMutex, async () => {
+  const credentials = getCredentials();
 
-  if (email && password) {
-    return await performLogin(email, password);
+  if (credentials) {
+    return await performLogin(credentials.email, credentials.password);
   }
 
   return {
@@ -302,6 +341,7 @@ export async function initiateLogin(): Promise<{
     instructions:
       "Set MARRIOTT_EMAIL and MARRIOTT_PASSWORD environment variables for automatic login, or visit the loginUrl to sign in manually. After signing in, use status to verify.",
   };
+});
 }
 
 async function performLogin(
@@ -312,7 +352,9 @@ async function performLogin(
   const p = await getPage();
 
   try {
-    await p.goto(`${MARRIOTT_BASE_URL}/loyalty/loginPage.mi`, {
+    const url = `${MARRIOTT_BASE_URL}/loyalty/loginPage.mi`;
+    assertMarriottUrl(url);
+    await p.goto(url, {
       waitUntil: "domcontentloaded",
     });
     await randomDelay(1000, 2000);
@@ -345,8 +387,8 @@ async function performLogin(
     await p.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 });
     await randomDelay(1000, 2000);
 
-    const url = p.url();
-    if (url.includes("signin") || url.includes("login")) {
+    const currentUrl = p.url();
+    if (currentUrl.includes("signin") || currentUrl.includes("login")) {
       throw new Error("Login failed. Please check credentials or try manual login.");
     }
 
@@ -379,6 +421,7 @@ export async function searchHotels(params: {
   rooms?: number;
   maxResults?: number;
 }): Promise<HotelResult[]> {
+  return withMutex(browserMutex, async () => {
   const {
     destination,
     checkIn,
@@ -404,6 +447,7 @@ export async function searchHotels(params: {
 
   const searchUrl = `${MARRIOTT_BASE_URL}/search/findHotels.mi?${searchParams.toString()}`;
 
+  assertMarriottUrl(searchUrl);
   await p.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await randomDelay(2000, 4000);
 
@@ -500,11 +544,13 @@ export async function searchHotels(params: {
   }, Math.min(maxResults, 50));
 
   return hotels;
+});
 }
 
 // ─── Hotel Details ─────────────────────────────────────────────────────────────
 
 export async function getHotelDetails(hotelIdOrUrl: string): Promise<HotelDetails> {
+  return withMutex(browserMutex, async () => {
   const p = await getPage();
 
   let url: string;
@@ -514,6 +560,7 @@ export async function getHotelDetails(hotelIdOrUrl: string): Promise<HotelDetail
     url = `${MARRIOTT_BASE_URL}/hotels/hotel-overview/${hotelIdOrUrl}.mi`;
   }
 
+  assertMarriottUrl(url);
   await p.goto(url, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await randomDelay(1500, 3000);
 
@@ -623,6 +670,7 @@ export async function getHotelDetails(hotelIdOrUrl: string): Promise<HotelDetail
     url: p.url(),
     ...details,
   };
+});
 }
 
 // ─── Room Options ──────────────────────────────────────────────────────────────
@@ -635,8 +683,9 @@ export async function getRoomOptions(params: {
   children?: number;
   usePoints?: boolean;
 }): Promise<RoomOption[]> {
-  const { hotelId, checkIn, checkOut, adults = 1, children = 0, usePoints = false } = params;
-  const p = await getPage();
+  return withMutex(browserMutex, async () => {
+    const { hotelId, checkIn, checkOut, adults = 1, children = 0, usePoints = false } = params;
+    const p = await getPage();
 
   const searchParams = new URLSearchParams({
     propertyCode: hotelId,
@@ -649,6 +698,7 @@ export async function getRoomOptions(params: {
   });
 
   const url = `${MARRIOTT_BASE_URL}/hotels/rooms/${hotelId}.mi?${searchParams.toString()}`;
+  assertMarriottUrl(url);
   await p.goto(url, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await randomDelay(2000, 3500);
 
@@ -742,7 +792,8 @@ export async function getRoomOptions(params: {
     return results;
   });
 
-  return rooms;
+    return rooms;
+  });
 }
 
 // ─── Select Room ───────────────────────────────────────────────────────────────
@@ -800,7 +851,8 @@ export async function checkout(params: {
   | { requiresConfirmation: true; preview: object }
   | { success: boolean; confirmationNumber?: string; message: string }
 > {
-  const {
+  return withMutex(browserMutex, async () => {
+    const {
     hotelId = selectedHotelId,
     roomCode = selectedRoomCode,
     checkIn,
@@ -858,10 +910,9 @@ export async function checkout(params: {
     ...(selectedRatePlanCode ? { ratePlanCode: selectedRatePlanCode } : {}),
   });
 
-  await p.goto(
-    `${MARRIOTT_BASE_URL}/reservation/rateListMenu.mi?${searchParams.toString()}`,
-    { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT }
-  );
+  const checkoutUrl = `${MARRIOTT_BASE_URL}/reservation/rateListMenu.mi?${searchParams.toString()}`;
+  assertMarriottUrl(checkoutUrl);
+  await p.goto(checkoutUrl, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await randomDelay(2000, 3000);
 
   try {
@@ -946,17 +997,21 @@ export async function checkout(params: {
     return {
       success: false,
       message: `Checkout failed: ${msg}. The booking may not have completed.`,
-    };
-  }
+      };
+    }
+  });
 }
 
 // ─── Reservation Management ────────────────────────────────────────────────────
 
 export async function getReservation(confirmationNumber?: string): Promise<Reservation[]> {
+  return withMutex(browserMutex, async () => {
   const { context: ctx } = await initBrowser();
   const p = await getPage();
 
-  await p.goto(`${MARRIOTT_BASE_URL}/loyalty/myTrips/upcoming.mi`, {
+  const url = `${MARRIOTT_BASE_URL}/loyalty/myTrips/upcoming.mi`;
+  assertMarriottUrl(url);
+  await p.goto(url, {
     waitUntil: "domcontentloaded",
     timeout: DEFAULT_TIMEOUT,
   });
@@ -1022,6 +1077,7 @@ export async function getReservation(confirmationNumber?: string): Promise<Reser
   }, confirmationNumber || null);
 
   return reservations;
+});
 }
 
 export async function modifyReservation(params: {
@@ -1035,7 +1091,8 @@ export async function modifyReservation(params: {
   | { requiresConfirmation: true; preview: object }
   | { success: boolean; message: string }
 > {
-  const { confirmationNumber, newCheckIn, newCheckOut, newRoomType, specialRequests, confirm = false } =
+  return withMutex(browserMutex, async () => {
+    const { confirmationNumber, newCheckIn, newCheckOut, newRoomType, specialRequests, confirm = false } =
     params;
 
   const preview = {
@@ -1105,8 +1162,9 @@ export async function modifyReservation(params: {
 
   return {
     success: true,
-    message: `Modification submitted for reservation ${confirmationNumber}. Check your email for updated confirmation.`,
-  };
+      message: `Modification submitted for reservation ${confirmationNumber}. Check your email for updated confirmation.`,
+    };
+  });
 }
 
 export async function cancelReservation(params: {
@@ -1116,7 +1174,8 @@ export async function cancelReservation(params: {
   | { requiresConfirmation: true; preview: object }
   | { success: boolean; cancellationNumber?: string; message: string }
 > {
-  const { confirmationNumber, confirm = false } = params;
+  return withMutex(browserMutex, async () => {
+    const { confirmationNumber, confirm = false } = params;
 
   const preview = {
     confirmationNumber,
@@ -1169,8 +1228,9 @@ export async function cancelReservation(params: {
     cancellationNumber: cancellationNumber || undefined,
     message: cancellationNumber
       ? `Reservation ${confirmationNumber} cancelled. Cancellation number: ${cancellationNumber}`
-      : `Cancellation submitted for reservation ${confirmationNumber}. Check your email for confirmation.`,
-  };
+        : `Cancellation submitted for reservation ${confirmationNumber}. Check your email for confirmation.`,
+    };
+  });
 }
 
 // ─── Check-In ──────────────────────────────────────────────────────────────────
@@ -1180,15 +1240,15 @@ export async function checkIn(params: {
   estimatedArrivalTime?: string;
   roomPreferences?: string;
 }): Promise<{ success: boolean; message: string; roomNumber?: string; mobileKeyAvailable?: boolean }> {
+  return withMutex(browserMutex, async () => {
   const { confirmationNumber, estimatedArrivalTime, roomPreferences } = params;
 
   const { context: ctx } = await initBrowser();
   const p = await getPage();
 
-  await p.goto(
-    `${MARRIOTT_BASE_URL}/loyalty/myTrips/mobileCheckIn.mi?confirmationNumber=${confirmationNumber}`,
-    { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT }
-  );
+  const checkInUrl = `${MARRIOTT_BASE_URL}/loyalty/myTrips/mobileCheckIn.mi?confirmationNumber=${confirmationNumber}`;
+  assertMarriottUrl(checkInUrl);
+  await p.goto(checkInUrl, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
   await randomDelay(1500, 2500);
 
   if (p.url().includes("signin") || p.url().includes("login")) {
@@ -1245,15 +1305,19 @@ export async function checkIn(params: {
     roomNumber: roomNumber || undefined,
     mobileKeyAvailable,
   };
+});
 }
 
 // ─── Bonvoy Status ─────────────────────────────────────────────────────────────
 
 export async function getBonvoyStatus(): Promise<BonvoyStatus> {
+  return withMutex(browserMutex, async () => {
   const { context: ctx } = await initBrowser();
   const p = await getPage();
 
-  await p.goto(`${MARRIOTT_BASE_URL}/loyalty/myAccount/dashboard.mi`, {
+  const url = `${MARRIOTT_BASE_URL}/loyalty/myAccount/dashboard.mi`;
+  assertMarriottUrl(url);
+  await p.goto(url, {
     waitUntil: "domcontentloaded",
     timeout: DEFAULT_TIMEOUT,
   });
@@ -1336,6 +1400,7 @@ export async function getBonvoyStatus(): Promise<BonvoyStatus> {
 
   await saveCookies(ctx);
   return status;
+});
 }
 
 // ─── Redeem Points ─────────────────────────────────────────────────────────────
@@ -1351,6 +1416,7 @@ export async function redeemPoints(params: {
   | { requiresConfirmation: true; preview: object }
   | { success: boolean; confirmationNumber?: string; pointsUsed?: number; message: string }
 > {
+  return withMutex(browserMutex, async () => {
   const { hotelId, checkIn, checkOut, adults = 1, roomCode, confirm = false } = params;
 
   // Get available point rates
@@ -1411,6 +1477,7 @@ export async function redeemPoints(params: {
   }
 
   return { success: false, message: "Redemption could not be completed." };
+});
 }
 
 // ─── Stay History ──────────────────────────────────────────────────────────────
@@ -1418,12 +1485,15 @@ export async function redeemPoints(params: {
 export async function getStayHistory(params: {
   limit?: number;
 }): Promise<StayHistory> {
+  return withMutex(browserMutex, async () => {
   const { limit = 20 } = params;
 
   const { context: ctx } = await initBrowser();
   const p = await getPage();
 
-  await p.goto(`${MARRIOTT_BASE_URL}/loyalty/myTrips/pastStays.mi`, {
+  const url = `${MARRIOTT_BASE_URL}/loyalty/myTrips/pastStays.mi`;
+  assertMarriottUrl(url);
+  await p.goto(url, {
     waitUntil: "domcontentloaded",
     timeout: DEFAULT_TIMEOUT,
   });
@@ -1506,6 +1576,7 @@ export async function getStayHistory(params: {
     totalStays: history.stays.length,
     totalNights: history.totalNights,
   };
+});
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
