@@ -29,6 +29,14 @@
   ],
   "author": "Strider Labs <hello@striderlabs.ai>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YHRen/marriott_mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YHRen/marriott_mcp/issues"
+  },
+  "homepage": "https://github.com/YHRen/marriott_mcp#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "playwright": "^1.40.0",

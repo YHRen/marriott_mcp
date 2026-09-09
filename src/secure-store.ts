@@ -3,7 +3,8 @@
  *
  * Encrypted cookie/session persistence and credential management.
  * Replaces plaintext JSON storage with AES-256-GCM encryption.
- * Files are only usable on the machine + user that created them.
+ * Encryption protects individual files; it is not an OS keychain. A copy of
+ * the directory plus the hostname/username is sufficient to derive the key.
  */
 
 import * as crypto from "crypto";
@@ -12,10 +13,13 @@ import * as path from "path";
 import * as os from "os";
 import type { BrowserContext, Cookie } from "playwright";
 
-const CONFIG_DIR = path.join(os.homedir(), ".striderlabs", "marriott");
+const CONFIG_DIR = process.env.MARRIOTT_CONFIG_DIR
+  ? path.resolve(process.env.MARRIOTT_CONFIG_DIR)
+  : path.join(os.homedir(), ".striderlabs", "marriott");
 const KEY_FILE = path.join(CONFIG_DIR, "key.bin");
 const COOKIES_FILE = path.join(CONFIG_DIR, "cookies.enc");
 const SESSION_FILE = path.join(CONFIG_DIR, "session.enc");
+const ATTEMPTS_FILE = path.join(CONFIG_DIR, "booking-attempts.enc");
 
 export interface SessionInfo {
   isLoggedIn: boolean;
@@ -35,14 +39,15 @@ function ensureConfigDir(): void {
   if (!fs.existsSync(CONFIG_DIR)) {
     fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   }
+  fs.chmodSync(CONFIG_DIR, 0o700);
 }
 
 // ─── Encryption Primitives ──────────────────────────────────────────────────
 
 /**
  * Derive encryption key from machine-specific values + a stored random salt.
- * The resulting key is deterministic per-machine per-user, so encrypted files
- * are useless if copied to another machine or accessed by another user.
+ * Hostname and username are not secrets. For stronger protection of directory
+ * backups, an OS keychain integration is required.
  */
 function getEncryptionKey(): Buffer {
   ensureConfigDir();
@@ -103,7 +108,19 @@ function saveEncrypted(filepath: string, data: unknown): void {
   ensureConfigDir();
   const json = JSON.stringify(data);
   const encrypted = encrypt(json);
-  fs.writeFileSync(filepath, encrypted, { encoding: "utf-8", mode: 0o600 });
+  const temporary = `${filepath}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  try {
+    const fd = fs.openSync(temporary, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, encrypted, { encoding: "utf-8" });
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(temporary, filepath);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
 }
 
 /**
@@ -146,7 +163,7 @@ export async function loadCookies(context: BrowserContext): Promise<boolean> {
 
   // Filter out expired cookies
   const now = Date.now() / 1000;
-  const validCookies = cookies.filter((c) => !c.expires || c.expires > now);
+  const validCookies = cookies.filter((c) => c.expires === -1 || !c.expires || c.expires > now);
 
   if (validCookies.length > 0) {
     await context.addCookies(validCookies);
@@ -217,4 +234,26 @@ export function hasSavedCookies(): boolean {
  */
 export function getConfigDir(): string {
   return CONFIG_DIR;
+}
+
+export interface BookingAttempt {
+  status: "unknown" | "confirmed";
+  confirmationNumber?: string;
+  createdAt: string;
+}
+
+/** Retained across logout/restart to prevent retrying an ambiguous submission. */
+export function loadBookingAttempts(): Record<string, BookingAttempt> {
+  if (!fs.existsSync(ATTEMPTS_FILE)) return {};
+  const attempts = loadEncrypted<Record<string, BookingAttempt>>(ATTEMPTS_FILE);
+  if (!attempts || typeof attempts !== "object" || Array.isArray(attempts) || Object.values(attempts).some(a => !a || !["unknown", "confirmed"].includes(a.status) || typeof a.createdAt !== "string")) {
+    throw new Error("Booking journal unreadable. Reconcile reservations before booking again.");
+  }
+  return attempts;
+}
+
+export function saveBookingAttempt(key: string, attempt: BookingAttempt): void {
+  const attempts = loadBookingAttempts();
+  attempts[key] = attempt;
+  saveEncrypted(ATTEMPTS_FILE, attempts);
 }

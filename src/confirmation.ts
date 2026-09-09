@@ -7,6 +7,7 @@
  */
 
 import * as crypto from "crypto";
+import { isDeepStrictEqual } from "node:util";
 
 interface PendingConfirmation {
   token: string;
@@ -39,7 +40,7 @@ export function createConfirmationToken(
   pending.set(token, {
     token,
     action,
-    data,
+    data: structuredClone(data),
     expires: Date.now() + TOKEN_TTL_MS,
   });
 
@@ -57,7 +58,8 @@ export function createConfirmationToken(
  */
 export function validateConfirmationToken(
   token: string,
-  expectedAction: string
+  expectedAction: string,
+  expectedData?: Record<string, unknown>
 ): Record<string, unknown> {
   pruneExpired();
 
@@ -80,6 +82,12 @@ export function validateConfirmationToken(
     throw new Error(
       `Confirmation token is for "${entry.action}", not "${expectedAction}".`
     );
+  }
+
+  if (expectedData && !isDeepStrictEqual(
+    JSON.parse(JSON.stringify(entry.data)), JSON.parse(JSON.stringify(expectedData))
+  )) {
+    throw new Error("Confirmation parameters changed. Request a new preview before confirming.");
   }
 
   // Single-use: delete after successful validation

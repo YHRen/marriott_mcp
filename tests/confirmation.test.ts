@@ -39,6 +39,14 @@ describe("validateConfirmationToken", () => {
     expect(result).toEqual(data);
   });
 
+  it("rejects changed parameters and snapshots the original request", () => {
+    const data = { confirmationNumber: "ABC1234", changes: { room: "KING" } };
+    const token = createConfirmationToken("modify_reservation", data);
+    data.changes.room = "SUITE";
+    expect(() => validateConfirmationToken(token, "modify_reservation", data)).toThrow("parameters changed");
+    expect(validateConfirmationToken(token, "modify_reservation", { confirmationNumber: "ABC1234", changes: { room: "KING" } })).toEqual({ confirmationNumber: "ABC1234", changes: { room: "KING" } });
+  });
+
   it("rejects an invalid token", () => {
     expect(() =>
       validateConfirmationToken("deadbeef00000000deadbeef00000000", "checkout")

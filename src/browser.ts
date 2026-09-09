@@ -10,9 +10,17 @@ import {
   loadCookies,
   saveSessionInfo,
   getCredentials,
+  clearAuthData,
   type SessionInfo,
 } from "./secure-store.js";
 import { BrowserMutex, withMutex } from "./mutex.js";
+import { clearPendingConfirmations } from "./confirmation.js";
+import { BookingFlow, readStay, verifyStay, type CheckoutRequest } from "./booking.js";
+import { makeOffer, offerFingerprint, staySearchParams, type Offer, type Stay } from "./rates.js";
+import { resolveRateSelections, type RateOptions, type RateSelection } from "./rate-options.js";
+import { collectRateRows, currentRateListComplete, prepareRateList, RATE_RESULTS, RATE_ROWS, NO_ROOMS } from "./rates-dom.js";
+import { assertPageUsable, waitForResults, MarriottPageError } from "./page-state.js";
+import { attachChrome } from "./cdp.js";
 
 const MARRIOTT_BASE_URL = "https://www.marriott.com";
 const DEFAULT_TIMEOUT = 30000;
@@ -21,11 +29,7 @@ const DEFAULT_TIMEOUT = 30000;
 let browser: Browser | null = null;
 let context: BrowserContext | null = null;
 let page: Page | null = null;
-
-// In-memory state for booking flow
-let selectedHotelId: string | null = null;
-let selectedRoomCode: string | null = null;
-let selectedRatePlanCode: string | null = null;
+let attachedToUserChrome = false;
 
 /** Mutex to serialize all browser operations */
 const browserMutex = new BrowserMutex();
@@ -95,25 +99,7 @@ export interface HotelDetails extends HotelResult {
   petPolicy?: string;
 }
 
-export interface RoomOption {
-  code: string;
-  name: string;
-  description?: string;
-  maxGuests?: number;
-  bedType?: string;
-  sqft?: number;
-  view?: string;
-  pricePerNight?: string;
-  totalPrice?: string;
-  ratePlanCode?: string;
-  ratePlanName?: string;
-  freeCancellation?: boolean;
-  breakfastIncluded?: boolean;
-  pointsEarned?: number;
-  pointsRequired?: number;
-  available?: boolean;
-  imageUrl?: string;
-}
+export type RoomOption = Offer;
 
 export interface Extra {
   type: "parking" | "breakfast" | "late_checkout" | "early_checkin" | "airport_transfer" | "spa_credit";
@@ -186,14 +172,28 @@ async function initBrowser(): Promise<{
   context: BrowserContext;
   page: Page;
 }> {
-  if (browser && context && page) {
+  if (browser && context && page && browser.isConnected() && !page.isClosed()) {
     return { browser, context, page };
+  }
+  if (browser || context || page) await closeBrowserInternal();
+
+  if (process.env.MARRIOTT_CDP_URL) {
+    const attached = await attachChrome(process.env.MARRIOTT_CDP_URL);
+    browser = attached.browser;
+    context = attached.context;
+    page = attached.page;
+    attachedToUserChrome = true;
+    page.setDefaultTimeout(DEFAULT_TIMEOUT);
+    // Preserve Chrome's existing consent, storage, cache, and browser settings.
+    // Explicit navigation URLs are still validated by the operations below.
+    return attached;
   }
 
   browser = await chromium.launch({
-    headless: true,
+    headless: process.env.MARRIOTT_HEADLESS === "true",
+    chromiumSandbox: process.env.MARRIOTT_NO_SANDBOX !== "true",
+    ...(process.env.MARRIOTT_BROWSER_CHANNEL ? { channel: process.env.MARRIOTT_BROWSER_CHANNEL } : {}),
     args: [
-      "--disable-blink-features=AutomationControlled",
       "--disable-dev-shm-usage",
       "--disable-accelerated-2d-canvas",
       "--no-first-run",
@@ -206,8 +206,6 @@ async function initBrowser(): Promise<{
   });
 
   context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     viewport: { width: 1280, height: 900 },
     locale: "en-US",
     timezoneId: "America/New_York",
@@ -216,11 +214,12 @@ async function initBrowser(): Promise<{
     },
   });
 
-  // Patch navigator to avoid bot detection
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+  // Keep navigation inside Marriott; third-party static resources may still load.
+  await context.route("**/*", async route => {
+    if (route.request().isNavigationRequest() && !route.request().frame().parentFrame()) {
+      try { assertMarriottUrl(route.request().url()); } catch { await route.abort(); return; }
+    }
+    await route.continue();
   });
 
   // Load saved cookies if available
@@ -233,25 +232,70 @@ async function initBrowser(): Promise<{
 }
 
 export async function closeBrowser(): Promise<void> {
-  return withMutex(browserMutex, async () => {
+  return withMutex(browserMutex, closeBrowserInternal);
+}
+
+async function closeBrowserInternal(): Promise<void> {
+  bookingFlow.reset();
+  clearPendingConfirmations();
   if (page) {
     await page.close().catch(() => {});
     page = null;
   }
   if (context) {
-    await context.close().catch(() => {});
+    if (!attachedToUserChrome) await context.close().catch(() => {});
     context = null;
   }
   if (browser) {
     await browser.close().catch(() => {});
     browser = null;
   }
-});
+  attachedToUserChrome = false;
+}
+
+export async function logoutBrowser() {
+  return withMutex(browserMutex, async () => {
+    const detached = attachedToUserChrome || Boolean(process.env.MARRIOTT_CDP_URL);
+    await closeBrowserInternal();
+    clearAuthData();
+    return { success: true, message: detached
+      ? "MCP disconnected and its saved authentication was cleared. Chrome remains signed in; use Marriott's Sign Out in that profile to end the website session."
+      : "Logged out. Session and cookies cleared." };
+  });
+}
+
+async function persistCookies(ctx: BrowserContext): Promise<void> {
+  if (!attachedToUserChrome) await saveCookies(ctx);
+}
+
+function persistSession(info: SessionInfo): void {
+  if (!attachedToUserChrome) saveSessionInfo(info);
 }
 
 async function getPage(): Promise<Page> {
   const { page: p } = await initBrowser();
   return p;
+}
+
+async function navigate(url: string): Promise<Page> {
+  assertMarriottUrl(url);
+  const p = await getPage();
+  const response = await p.goto(url, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
+  assertMarriottUrl(p.url());
+  await assertPageUsable(p, response?.status());
+  if (context) await persistCookies(context);
+  return p;
+}
+
+const bookingFlow = new BookingFlow(navigate);
+
+export async function recoverSession() {
+  return withMutex(browserMutex, async () => {
+    if (!process.env.MARRIOTT_CDP_URL && process.env.MARRIOTT_HEADLESS === "true") throw new Error("Restart with MARRIOTT_HEADLESS=false to enable manual recovery in the server browser.");
+    const p = await getPage();
+    await p.bringToFront();
+    return { success: true, message: "Complete verification in the open Marriott browser, then retry your search. Use status after signing in." };
+  });
 }
 
 // ─── Auth ──────────────────────────────────────────────────────────────────────
@@ -271,15 +315,26 @@ export async function checkLoginStatus(): Promise<SessionInfo> {
     await randomDelay(500, 1000);
 
     // Check if redirected to login page
-    const currentUrl = p.url();
-    if (currentUrl.includes("signin") || currentUrl.includes("login")) {
+    assertMarriottUrl(p.url());
+    const currentUrl = new URL(p.url());
+    if (/\/(?:sign-?in|login|loyalty\/loginPage)(?:[/.]|$)/i.test(currentUrl.pathname)) {
       const info: SessionInfo = {
         isLoggedIn: false,
         lastUpdated: new Date().toISOString(),
       };
-      saveSessionInfo(info);
+      persistSession(info);
       return info;
     }
+
+    await assertPageUsable(p);
+
+    // The current account page omits the legacy member selectors. Its Sign Out
+    // link lives in a collapsed menu, so visibility is not an authentication test.
+    // Require both the protected account route and account title as corroboration.
+    const accountPage = currentUrl.pathname === "/loyalty/myAccount/default.mi"
+      && /^my account$/i.test((await p.title()).trim());
+    const hasSignOut = accountPage && await p.locator("a, button")
+      .filter({ hasText: /^\s*sign out\s*$/i }).count() > 0;
 
     // Extract user info
     const userName = await p
@@ -304,17 +359,18 @@ export async function checkLoginStatus(): Promise<SessionInfo> {
       .catch(() => null);
 
     const info: SessionInfo = {
-      isLoggedIn: true,
+      isLoggedIn: Boolean(userName && bonvoyNumber) || hasSignOut,
       userName: userName || undefined,
       bonvoyNumber: bonvoyNumber || undefined,
       bonvoyTier: tier || undefined,
       lastUpdated: new Date().toISOString(),
     };
 
-    await saveCookies(ctx);
-    saveSessionInfo(info);
+    await persistCookies(ctx);
+    persistSession(info);
     return info;
   } catch (error) {
+    if (error instanceof MarriottPageError) throw error;
     return {
       isLoggedIn: false,
       lastUpdated: new Date().toISOString(),
@@ -329,17 +385,21 @@ export async function initiateLogin(): Promise<{
   instructions: string;
 }> {
   return withMutex(browserMutex, async () => {
-  const credentials = getCredentials();
+  const credentials = process.env.MARRIOTT_CDP_URL ? null : getCredentials();
 
   if (credentials) {
     return await performLogin(credentials.email, credentials.password);
   }
 
+  if (!process.env.MARRIOTT_CDP_URL && process.env.MARRIOTT_HEADLESS === "true") throw new Error("Manual login requires MARRIOTT_HEADLESS=false. Restart the server with that setting.");
+  const p = await getPage();
+  await p.goto(`${MARRIOTT_BASE_URL}/`, { waitUntil: "domcontentloaded" });
+  await p.bringToFront();
   return {
-    message: "Manual login required",
+    message: "Manual login required in the opened server browser",
     loginUrl: `${MARRIOTT_BASE_URL}/loyalty/loginPage.mi`,
     instructions:
-      "Set MARRIOTT_EMAIL and MARRIOTT_PASSWORD environment variables for automatic login, or visit the loginUrl to sign in manually. After signing in, use status to verify.",
+      "Make your privacy choices and sign in from Marriott's homepage in this browser. Then call status. Attached Chrome profiles retain their own session; the MCP does not export their cookies.",
   };
 });
 }
@@ -384,15 +444,15 @@ async function performLogin(
     );
     await submitButton.click();
 
-    await p.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 });
-    await randomDelay(1000, 2000);
+    await p.locator('[data-testid="member-number"], .l-member-number, [class*="memberNumber"]').first().waitFor({ state: "visible", timeout: 15000 });
+    await assertPageUsable(p);
 
     const currentUrl = p.url();
     if (currentUrl.includes("signin") || currentUrl.includes("login")) {
       throw new Error("Login failed. Please check credentials or try manual login.");
     }
 
-    await saveCookies(ctx);
+    await persistCookies(ctx);
 
     return {
       message: "Login successful",
@@ -405,14 +465,41 @@ async function performLogin(
       message: `Login attempt: ${msg}`,
       loginUrl: `${MARRIOTT_BASE_URL}/loyalty/loginPage.mi`,
       instructions:
-        "Automatic login encountered an issue. Try visiting the loginUrl manually, then use status to verify.",
+        "Automatic login encountered an issue. Use recover_session and finish signing in in the server browser, then use status.",
     };
   }
 }
 
 // ─── Hotel Search ──────────────────────────────────────────────────────────────
 
-export async function searchHotels(params: {
+export interface RoomSearchParams extends RateOptions {
+  hotelId: string;
+  checkIn: string;
+  checkOut: string;
+  adults?: number;
+  children?: number;
+  rooms?: number;
+  usePoints?: boolean;
+}
+
+export interface RateResult {
+  selection: RateSelection;
+  availability: "available" | "unavailable" | "unknown";
+  offers: Offer[];
+  unmatchedRateCount: number;
+  coverage: { complete: boolean; note: string };
+  error?: string;
+}
+
+export interface RoomSearchResult {
+  offers: Offer[];
+  rateResults: RateResult[];
+  decisionRequired: true;
+  governmentAvailability: "available" | "unavailable" | "unknown" | "not_requested";
+  coverage: { complete: boolean; note: string };
+}
+
+export async function searchHotels(params: RateOptions & {
   destination: string;
   checkIn: string;
   checkOut: string;
@@ -420,131 +507,88 @@ export async function searchHotels(params: {
   children?: number;
   rooms?: number;
   maxResults?: number;
-}): Promise<HotelResult[]> {
+  maxPages?: number;
+}) {
   return withMutex(browserMutex, async () => {
-  const {
-    destination,
-    checkIn,
-    checkOut,
-    adults = 1,
-    children = 0,
-    rooms = 1,
-    maxResults = 10,
-  } = params;
-
-  const p = await getPage();
-
-  // Build search URL
-  const searchParams = new URLSearchParams({
-    "destinationAddress.destination": destination,
-    "fromDate": checkIn,
-    "toDate": checkOut,
-    "numberOfRooms": String(rooms),
-    "guestCounts[0].numAdults": String(adults),
-    "guestCounts[0].numChildren": String(children),
-    "numberOfNights": String(calcNights(checkIn, checkOut)),
+    const selections = resolveRateSelections(params);
+    const hotels = new Map<string, HotelResult>();
+    const searches: { selection: RateSelection; complete: boolean; error?: string }[] = [];
+    let complete = true;
+    const maxResults = params.maxResults ?? 10;
+    const maxPages = params.maxPages ?? 5;
+    for (const selection of selections) {
+      try {
+      const query = staySearchParams({ ...params, adults: params.adults ?? 1, children: params.children ?? 0, rooms: params.rooms ?? 1, usePoints: false }, selection);
+      query.set("destinationAddress.destination", params.destination);
+      const p = await navigate(`${MARRIOTT_BASE_URL}/search/findHotels.mi?${query}`);
+      let exhausted = false;
+      for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
+        const state = await waitForResults(p, '[data-testid="property-card"], .property-card, .l-property-card', '[data-testid="no-results"], .no-results');
+        const actual = await readStay(p);
+        if (actual.checkIn !== params.checkIn || actual.checkOut !== params.checkOut) {
+          throw new Error("UNVERIFIED_STAY: Marriott did not apply the requested search dates. Availability is unknown.");
+        }
+        if (state === "empty") { exhausted = true; break; }
+        const found = await p.evaluate(() => {
+          return Array.from(document.querySelectorAll('[data-testid="property-card"], .property-card, .l-property-card')).map(card => {
+            const anchor = card.querySelector<HTMLAnchorElement>("a.view-rates-button-container[href]")
+              || card.querySelector<HTMLAnchorElement>("a[href]");
+            const url = anchor?.href || "";
+            const id = card.getAttribute("data-property-id") || card.getAttribute("data-hotel-id") || card.getAttribute("data-marsha")
+              || (url ? new URL(url).searchParams.get("propertyCode") : "")
+              || url.match(/\/(?:travel|hotel-overview)\/([a-z0-9]{5})(?:-|[/.])/i)?.[1]
+              || url.match(/\/hotels\/([a-z0-9]{5})-/i)?.[1] || "";
+            return {
+              id: id.toUpperCase(),
+              name: card.querySelector('[data-testid="property-name"], .property-name, button.title-container, h2, h3')?.textContent?.trim() || "",
+              url,
+              location: card.querySelector('[data-testid="location"], .location, .address')?.textContent?.trim(),
+              pricePerNight: card.querySelector('[data-testid="price"], .price')?.textContent?.trim(),
+            };
+          });
+        });
+        if (!found.some(hotel => /^[A-Z0-9]{2,10}$/.test(hotel.id) && hotel.name)) {
+          throw new MarriottPageError("PAGE_CHANGED", "Hotel cards were present but no hotel identifiers and names could be verified. Availability is unknown.");
+        }
+        for (const hotel of found) {
+          if (!/^[A-Z0-9]{2,10}$/.test(hotel.id) || !hotel.name) { complete = false; continue; }
+          if (hotels.size < maxResults || hotels.has(hotel.id)) hotels.set(hotel.id, hotel);
+          else complete = false;
+        }
+        const nextButton = p.locator('[data-testid="next-page"], a[rel="next"], button[aria-label="Next page"]').first();
+        if (!await nextButton.count() || !await nextButton.isEnabled() || await nextButton.getAttribute("aria-disabled") === "true") {
+          // Completeness needs positive end/count evidence, not merely a missing selector.
+          exhausted = Boolean(await p.locator('[data-testid="results-complete"], [data-has-more="false"]').count())
+            || Boolean(await nextButton.count());
+          break;
+        }
+        if (hotels.size >= maxResults) break;
+        const before = await p.locator('[data-testid="property-card"], .property-card, .l-property-card').allTextContents();
+        await nextButton.click();
+        await p.waitForFunction(previous => JSON.stringify(Array.from(document.querySelectorAll('[data-testid="property-card"], .property-card, .l-property-card')).map(el => el.textContent)) !== JSON.stringify(previous), before, { timeout: 15000 });
+      }
+      complete &&= exhausted;
+      searches.push({ selection, complete: exhausted });
+      } catch (error) {
+        if (!isUnrecognizedRatePage(error)) throw error;
+        complete = false;
+        searches.push({ selection, complete: false, error: error.message });
+      }
+    }
+    const results = [];
+    for (const hotel of hotels.values()) {
+      const rates = await getRoomOptionsInternal({ ...params, hotelId: hotel.id });
+      results.push({ ...hotel, ...rates });
+      complete &&= rates.coverage.complete;
+    }
+    return {
+      hotels: results, count: results.length,
+      searches,
+      selectedRates: selections,
+      decisionRequired: true,
+      coverage: { complete, maxResults, maxPages, note: complete ? "All inspected offers are returned for user review; no rate was selected." : "Partial coverage: result limits, unrecognized pages or unexpanded rates may hide offers. Unknown is not unavailable." },
+    };
   });
-
-  const searchUrl = `${MARRIOTT_BASE_URL}/search/findHotels.mi?${searchParams.toString()}`;
-
-  assertMarriottUrl(searchUrl);
-  await p.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-  await randomDelay(2000, 4000);
-
-  // Wait for hotel cards
-  try {
-    await p.waitForSelector(
-      '[data-testid="property-card"], .l-property-card, .property-card, [class*="propertyCard"]',
-      { timeout: 15000 }
-    );
-  } catch {
-    // Try waiting for any results
-    await p.waitForSelector('.search-results, #search-results, [class*="searchResult"]', {
-      timeout: 10000,
-    }).catch(() => {});
-  }
-
-  await randomDelay(500, 1000);
-
-  const hotels = await p.evaluate((limit) => {
-    const results: HotelResult[] = [];
-
-    // Try multiple card selectors
-    const cards = document.querySelectorAll(
-      '[data-testid="property-card"], .l-property-card, .property-card, [class*="propertyCard"], [class*="hotel-card"]'
-    );
-
-    let count = 0;
-    cards.forEach((card, index) => {
-      if (count >= limit) return;
-
-      const name =
-        card.querySelector('[data-testid="property-name"], .l-property-name, .property-name, h2, h3')
-          ?.textContent?.trim() || "";
-
-      if (!name) return;
-
-      const id =
-        card.getAttribute("data-property-id") ||
-        card.getAttribute("data-hotel-id") ||
-        card.querySelector("a")?.href?.match(/propertyCode=([A-Z0-9]+)/)?.[1] ||
-        String(index);
-
-      const url =
-        card.querySelector("a[href*='propertyPage']")?.getAttribute("href") ||
-        card.querySelector("a")?.getAttribute("href") || "";
-
-      const priceEl = card.querySelector(
-        '[data-testid="price"], .l-price, .price, [class*="price"]'
-      );
-      const priceText = priceEl?.textContent?.trim() || "";
-      const priceMatch = priceText.match(/\$[\d,]+/);
-
-      const ratingEl = card.querySelector(
-        '[data-testid="star-rating"], [aria-label*="star"], [class*="starRating"], [class*="star-rating"]'
-      );
-      const ratingText = ratingEl?.getAttribute("aria-label") || ratingEl?.textContent || "";
-      const starMatch = ratingText.match(/(\d+(?:\.\d+)?)\s*(?:out of\s*\d+\s*)?star/i);
-
-      const guestRatingEl = card.querySelector(
-        '[data-testid="guest-rating"], [class*="guestRating"], [class*="reviewScore"]'
-      );
-
-      const locationEl = card.querySelector(
-        '[data-testid="location"], .l-location, [class*="location"], [class*="address"]'
-      );
-
-      const imgEl = card.querySelector("img");
-
-      const brand =
-        card.getAttribute("data-brand") ||
-        card.querySelector('[class*="brand"]')?.textContent?.trim() || undefined;
-
-      const freeCancellation =
-        card.querySelector('[class*="freeCancel"], [class*="free-cancel"]') !== null ||
-        card.textContent?.toLowerCase().includes("free cancellation") || false;
-
-      results.push({
-        id,
-        name,
-        brand,
-        url: url.startsWith("http") ? url : `https://www.marriott.com${url}`,
-        starRating: starMatch ? parseFloat(starMatch[1]) : undefined,
-        guestRating: guestRatingEl?.textContent?.trim() || undefined,
-        location: locationEl?.textContent?.trim() || undefined,
-        pricePerNight: priceMatch ? priceMatch[0] : undefined,
-        imageUrl: imgEl?.src || imgEl?.getAttribute("data-src") || undefined,
-        freeCancellation,
-      });
-
-      count++;
-    });
-
-    return results;
-  }, Math.min(maxResults, 50));
-
-  return hotels;
-});
 }
 
 // ─── Hotel Details ─────────────────────────────────────────────────────────────
@@ -675,331 +719,112 @@ export async function getHotelDetails(hotelIdOrUrl: string): Promise<HotelDetail
 
 // ─── Room Options ──────────────────────────────────────────────────────────────
 
-export async function getRoomOptions(params: {
-  hotelId: string;
-  checkIn: string;
-  checkOut: string;
-  adults?: number;
-  children?: number;
-  usePoints?: boolean;
-}): Promise<RoomOption[]> {
-  return withMutex(browserMutex, async () => {
-    const { hotelId, checkIn, checkOut, adults = 1, children = 0, usePoints = false } = params;
-    const p = await getPage();
-
-  const searchParams = new URLSearchParams({
-    propertyCode: hotelId,
-    fromDate: checkIn,
-    toDate: checkOut,
-    "guestCounts[0].numAdults": String(adults),
-    "guestCounts[0].numChildren": String(children),
-    numberOfRooms: "1",
-    ...(usePoints ? { redeemPoints: "true" } : {}),
-  });
-
-  const url = `${MARRIOTT_BASE_URL}/hotels/rooms/${hotelId}.mi?${searchParams.toString()}`;
-  assertMarriottUrl(url);
-  await p.goto(url, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-  await randomDelay(2000, 3500);
-
-  selectedHotelId = hotelId;
-
-  const rooms = await p.evaluate(() => {
-    const results: RoomOption[] = [];
-
-    const cards = document.querySelectorAll(
-      '[data-testid="room-type-card"], .l-room-type, .room-type, [class*="roomType"], [class*="room-card"]'
-    );
-
-    cards.forEach((card, index) => {
-      const name =
-        card.querySelector(
-          '[data-testid="room-name"], .room-name, h2, h3, [class*="roomName"]'
-        )?.textContent?.trim() || `Room ${index + 1}`;
-
-      const code =
-        card.getAttribute("data-room-type-code") ||
-        card.getAttribute("data-room-code") ||
-        String(index);
-
-      const description = card.querySelector('[class*="description"]')
-        ?.textContent?.trim() || undefined;
-
-      const bedType = card.querySelector('[class*="bed"], [data-testid="bed-type"]')
-        ?.textContent?.trim() || undefined;
-
-      const maxGuests = (() => {
-        const guestEl = card.querySelector('[class*="maxGuest"], [class*="occupancy"]');
-        const match = guestEl?.textContent?.match(/\d+/);
-        return match ? parseInt(match[0]) : undefined;
-      })();
-
-      const sqft = (() => {
-        const sizeEl = card.querySelector('[class*="sqft"], [class*="size"], [class*="area"]');
-        const match = sizeEl?.textContent?.match(/(\d+)\s*(?:sq\.?\s*ft|sqft)/i);
-        return match ? parseInt(match[1]) : undefined;
-      })();
-
-      const view = card.querySelector('[class*="view"]')?.textContent?.trim() || undefined;
-
-      const priceEl = card.querySelector(
-        '[data-testid="price"], .l-price, [class*="price"], [class*="rate"]'
-      );
-      const priceText = priceEl?.textContent?.trim() || "";
-      const priceMatch = priceText.match(/\$[\d,]+/);
-
-      const ratePlanCode =
-        card.getAttribute("data-rate-plan-code") ||
-        card.querySelector("[data-rate-plan]")?.getAttribute("data-rate-plan") || undefined;
-
-      const ratePlanName = card.querySelector('[class*="ratePlan"], [class*="rate-plan"]')
-        ?.textContent?.trim() || undefined;
-
-      const freeCancellation =
-        card.querySelector('[class*="freeCancel"]') !== null ||
-        card.textContent?.toLowerCase().includes("free cancellation") || false;
-
-      const breakfastIncluded =
-        card.textContent?.toLowerCase().includes("breakfast") &&
-        card.textContent?.toLowerCase().includes("included") || false;
-
-      const pointsEl = card.querySelector('[class*="points"], [class*="Points"]');
-      const pointsText = pointsEl?.textContent || "";
-      const pointsMatch = pointsText.match(/([\d,]+)\s*points?/i);
-      const pointsNum = pointsMatch ? parseInt(pointsMatch[1].replace(",", "")) : undefined;
-
-      const imgEl = card.querySelector("img");
-
-      results.push({
-        code,
-        name,
-        description,
-        bedType,
-        maxGuests,
-        sqft,
-        view,
-        pricePerNight: priceMatch ? priceMatch[0] : undefined,
-        ratePlanCode,
-        ratePlanName,
-        freeCancellation,
-        breakfastIncluded,
-        pointsRequired: pointsNum,
-        available: true,
-        imageUrl: imgEl?.src || imgEl?.getAttribute("data-src") || undefined,
-      });
-    });
-
-    return results;
-  });
-
-    return rooms;
-  });
+export async function getRoomOptions(params: RoomSearchParams): Promise<RoomSearchResult> {
+  return withMutex(browserMutex, () => getRoomOptionsInternal(params));
 }
 
-// ─── Select Room ───────────────────────────────────────────────────────────────
-
-export async function selectRoom(params: {
-  hotelId: string;
-  roomCode: string;
-  ratePlanCode?: string;
-}): Promise<{ success: boolean; message: string; nextStep: string }> {
-  const { hotelId, roomCode, ratePlanCode } = params;
-
-  selectedHotelId = hotelId;
-  selectedRoomCode = roomCode;
-  selectedRatePlanCode = ratePlanCode || null;
-
-  return {
-    success: true,
-    message: `Room ${roomCode} selected at hotel ${hotelId}${ratePlanCode ? ` with rate plan ${ratePlanCode}` : ""}.`,
-    nextStep: "Use add_extras to add optional services, or proceed to checkout.",
+/** Caller owns browserMutex. Internal calls never acquire it recursively. */
+async function getRoomOptionsInternal(params: RoomSearchParams): Promise<RoomSearchResult> {
+  const stay: Stay = {
+    hotelId: params.hotelId, checkIn: params.checkIn, checkOut: params.checkOut,
+    adults: params.adults ?? 1, children: params.children ?? 0, rooms: params.rooms ?? 1,
+    usePoints: params.usePoints ?? false,
   };
-}
-
-// ─── Add Extras ────────────────────────────────────────────────────────────────
-
-let pendingExtras: string[] = [];
-
-export async function addExtras(params: {
-  extras: Array<"parking" | "breakfast" | "late_checkout" | "early_checkin" | "airport_transfer" | "spa_credit">;
-}): Promise<{ success: boolean; selectedExtras: string[]; message: string }> {
-  pendingExtras = params.extras;
-
-  return {
-    success: true,
-    selectedExtras: params.extras,
-    message: `Extras queued: ${params.extras.join(", ")}. Proceed to checkout to apply them.`,
-  };
-}
-
-// ─── Checkout ──────────────────────────────────────────────────────────────────
-
-export async function checkout(params: {
-  hotelId?: string;
-  roomCode?: string;
-  checkIn: string;
-  checkOut: string;
-  adults?: number;
-  children?: number;
-  firstName?: string;
-  lastName?: string;
-  email?: string;
-  phone?: string;
-  specialRequests?: string;
-  confirm?: boolean;
-}): Promise<
-  | { requiresConfirmation: true; preview: object }
-  | { success: boolean; confirmationNumber?: string; message: string }
-> {
-  return withMutex(browserMutex, async () => {
-    const {
-    hotelId = selectedHotelId,
-    roomCode = selectedRoomCode,
-    checkIn,
-    checkOut,
-    adults = 1,
-    children = 0,
-    firstName,
-    lastName,
-    email,
-    phone,
-    specialRequests,
-    confirm = false,
-  } = params;
-
-  if (!hotelId || !roomCode) {
-    return {
-      success: false,
-      message: "No hotel or room selected. Use search_hotels, get_room_options, and select_room first.",
-    };
+  const selections = resolveRateSelections(params, stay.usePoints);
+  const offers: Offer[] = [];
+  const rateResults: RateResult[] = [];
+  let complete = true;
+  let governmentAvailability: RoomSearchResult["governmentAvailability"] = selections.some(s => s.rateType === "government") ? "unknown" : "not_requested";
+  for (const selection of selections) {
+    const result: RateResult = { selection, availability: "unknown", offers: [], unmatchedRateCount: 0, coverage: { complete: false, note: "Only verified rate rows are reported; missing terms remain unknown." } };
+    rateResults.push(result);
+    try {
+    const query = staySearchParams(stay, selection);
+    query.set("isSearch", "true");
+    query.set("showFullPrice", "true");
+    const p = await navigate(`${MARRIOTT_BASE_URL}/search/availabilityCalendar.mi?${query}`);
+    const state = await waitForResults(p, RATE_RESULTS, NO_ROOMS);
+    if (state === "results") await prepareRateList(p);
+    await verifyStay(p, stay);
+    const filterApplied = await rateFilterApplied(p, selection);
+    if (state === "empty") {
+      result.availability = filterApplied ? "unavailable" : "unknown";
+      result.coverage.complete = filterApplied;
+      if (selection.rateType === "government") governmentAvailability = result.availability;
+      complete &&= filterApplied;
+      continue;
+    }
+    let exhausted = false;
+    let termsComplete = true;
+    for (let ratePage = 0; ratePage < 5; ratePage++) {
+      await waitForResults(p, RATE_RESULTS, NO_ROOMS);
+      await verifyStay(p, stay);
+      const raw = await collectRateRows(p);
+      const currentFilterApplied = await rateFilterApplied(p, selection);
+      const found = raw.map(row => makeOffer(row, stay, selection, currentFilterApplied)).filter((offer): offer is Offer => Boolean(offer));
+      result.unmatchedRateCount += raw.length - found.length;
+      termsComplete &&= found.length === raw.length && found.every(o => Boolean(o.total && o.taxesIncluded && o.refundability !== "unknown"));
+      offers.push(...found);
+      result.offers.push(...found);
+      if (found.some(o => o.available)) result.availability = "available";
+      const next = p.locator('[data-testid="next-rates-page"], button[data-testid="load-more-rates"], a[rel="next"]').first();
+      if (!await next.count() || !await next.isEnabled() || await next.getAttribute("aria-disabled") === "true") {
+        exhausted = await currentRateListComplete(p)
+          || Boolean(await p.locator('[data-testid="rates-complete"], [data-rates-complete="true"]').count())
+          || Boolean(await next.count());
+        break;
+      }
+      const before = await p.locator(RATE_ROWS).allTextContents();
+      await next.click();
+      await p.waitForFunction(({ previous, selector }) => JSON.stringify(Array.from(document.querySelectorAll(selector)).map(el => el.textContent)) !== JSON.stringify(previous), { previous: before, selector: RATE_ROWS }, { timeout: 15000 });
+    }
+    result.offers = uniqueOffers(result.offers);
+    result.coverage.complete = exhausted && termsComplete;
+    } catch (error) {
+      if (!isUnrecognizedRatePage(error)) throw error;
+      result.error = error.message;
+      result.coverage.complete = false;
+    }
+    if (selection.rateType === "government") governmentAvailability = result.availability;
+    complete &&= result.coverage.complete;
   }
-
-  const preview = {
-    hotelId,
-    roomCode,
-    checkIn,
-    checkOut,
-    adults,
-    children,
-    extras: pendingExtras,
-    guestName: firstName && lastName ? `${firstName} ${lastName}` : undefined,
-    email,
-    specialRequests,
-    warning: "THIS WILL CHARGE YOUR SAVED PAYMENT METHOD. Confirm only if sure.",
+  const unique = uniqueOffers(offers);
+  bookingFlow.remember(unique);
+  return {
+    offers: unique, rateResults, governmentAvailability, decisionRequired: true,
+    coverage: { complete, note: complete ? "All rate rows verified; no rate was selected." : "Only verified visible rate rows are reported; missing totals/terms and unexpanded rates remain unknown." },
   };
+}
 
-  if (!confirm) {
-    return {
-      requiresConfirmation: true,
-      preview,
-    };
-  }
+function uniqueOffers(offers: Offer[]): Offer[] {
+  // Different quotes/terms must not overwrite each other merely because codes match.
+  return [...new Map(offers.map(o => [JSON.stringify([offerFingerprint(o), o.nightly, o.available]), o])).values()];
+}
 
-  const { context: ctx } = await initBrowser();
-  const p = await getPage();
+function isUnrecognizedRatePage(error: unknown): error is Error {
+  return error instanceof MarriottPageError && error.code === "PAGE_CHANGED"
+    || error instanceof Error && /^(?:UNVERIFIED_STAY|PAGE_CHANGED):/.test(error.message);
+}
 
-  // Navigate to booking page
-  const searchParams = new URLSearchParams({
-    propertyCode: hotelId,
-    roomTypeCode: roomCode,
-    fromDate: checkIn,
-    toDate: checkOut,
-    "guestCounts[0].numAdults": String(adults),
-    "guestCounts[0].numChildren": String(children),
-    numberOfRooms: "1",
-    ...(selectedRatePlanCode ? { ratePlanCode: selectedRatePlanCode } : {}),
+async function rateFilterApplied(page: Page, selection: RateSelection): Promise<boolean> {
+  const actual = await page.evaluate(() => {
+    const input = document.querySelector<HTMLInputElement>('input[name="clusterCode"]:checked, input[type="hidden"][name="clusterCode"], select[name="clusterCode"]');
+    return { cluster: input?.value.toLowerCase(), code: document.querySelector<HTMLInputElement>('input[name="corporateCode"]')?.value };
   });
+  const expected = { regular: "none", aaa_caa: "aaa", senior: "s9r", government: "gov", corporate_promo: "corp" }[selection.rateType];
+  return actual.cluster === expected && (selection.rateType !== "corporate_promo" || actual.code?.toUpperCase() === selection.corporateCode?.toUpperCase());
+}
 
-  const checkoutUrl = `${MARRIOTT_BASE_URL}/reservation/rateListMenu.mi?${searchParams.toString()}`;
-  assertMarriottUrl(checkoutUrl);
-  await p.goto(checkoutUrl, { waitUntil: "domcontentloaded", timeout: DEFAULT_TIMEOUT });
-  await randomDelay(2000, 3000);
+export async function selectRoom(params: { offerId?: string; hotelId?: string; roomCode?: string; ratePlanCode?: string }) {
+  return withMutex(browserMutex, async () => bookingFlow.select(params));
+}
 
-  try {
-    // Fill guest info if provided
-    if (firstName) {
-      const firstNameField = await p.$('input[name="firstName"], #firstName').catch(() => null);
-      if (firstNameField) {
-        await firstNameField.fill(firstName);
-        await randomDelay(200, 500);
-      }
-    }
+export async function addExtras(_params: { extras: string[] }) {
+  return { success: false, selectedExtras: [], message: "Extras are not implemented by this adapter. Choose a rate with the desired inclusions or arrange extras with the hotel; no extras have been added." };
+}
 
-    if (lastName) {
-      const lastNameField = await p.$('input[name="lastName"], #lastName').catch(() => null);
-      if (lastNameField) {
-        await lastNameField.fill(lastName);
-        await randomDelay(200, 500);
-      }
-    }
-
-    if (email) {
-      const emailField = await p.$('input[name="email"], input[type="email"]').catch(() => null);
-      if (emailField) {
-        await emailField.fill(email);
-        await randomDelay(200, 500);
-      }
-    }
-
-    if (phone) {
-      const phoneField = await p.$('input[name="phone"], input[type="tel"]').catch(() => null);
-      if (phoneField) {
-        await phoneField.fill(phone);
-        await randomDelay(200, 500);
-      }
-    }
-
-    if (specialRequests) {
-      const reqField = await p
-        .$('textarea[name="specialRequests"], textarea[id*="special"]')
-        .catch(() => null);
-      if (reqField) {
-        await reqField.fill(specialRequests);
-        await randomDelay(200, 500);
-      }
-    }
-
-    // Submit booking
-    const submitBtn = await p.waitForSelector(
-      'button[type="submit"], [data-testid="complete-booking"], .l-submit-btn, [class*="submitBtn"]',
-      { timeout: 10000 }
-    );
-    await submitBtn.click();
-
-    await p.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 20000 });
-    await randomDelay(1500, 2500);
-
-    // Extract confirmation number
-    const confirmationNumber = await p
-      .$eval(
-        '[data-testid="confirmation-number"], .l-confirmation-number, [class*="confirmationNumber"], [class*="confirmation-number"]',
-        (el) => el.textContent?.trim()
-      )
-      .catch(() => null);
-
-    await saveCookies(ctx);
-
-    // Clear state
-    selectedHotelId = null;
-    selectedRoomCode = null;
-    selectedRatePlanCode = null;
-    pendingExtras = [];
-
-    return {
-      success: true,
-      confirmationNumber: confirmationNumber || "See email for confirmation",
-      message: confirmationNumber
-        ? `Booking confirmed! Confirmation number: ${confirmationNumber}`
-        : "Booking submitted. Check your email for confirmation details.",
-    };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    return {
-      success: false,
-      message: `Checkout failed: ${msg}. The booking may not have completed.`,
-      };
-    }
-  });
+export async function checkout(params: CheckoutRequest) {
+  return withMutex(browserMutex, () => bookingFlow.checkout(params));
 }
 
 // ─── Reservation Management ────────────────────────────────────────────────────
@@ -1017,11 +842,13 @@ export async function getReservation(confirmationNumber?: string): Promise<Reser
   });
   await randomDelay(1500, 2500);
 
+  await waitForResults(p, '[data-testid="trip-card"], .l-trip-card, .trip-card, [class*="tripCard"], [class*="reservationCard"]', '[data-testid="no-trips"], .no-trips');
+
   if (p.url().includes("signin") || p.url().includes("login")) {
     throw new Error("Authentication required. Use login to sign in first.");
   }
 
-  await saveCookies(ctx);
+  await persistCookies(ctx);
 
   const reservations = await p.evaluate((targetConfirmation) => {
     const results: Reservation[] = [];
@@ -1126,6 +953,7 @@ export async function modifyReservation(params: {
   // Attempt date changes
   if (newCheckIn) {
     const checkInField = await p.$('input[name="fromDate"], #fromDate, [data-testid="check-in-date"]').catch(() => null);
+    if (!checkInField) throw new Error("Check-in date field missing. No modification submitted.");
     if (checkInField) {
       await checkInField.fill(newCheckIn);
       await randomDelay(300, 600);
@@ -1134,31 +962,40 @@ export async function modifyReservation(params: {
 
   if (newCheckOut) {
     const checkOutField = await p.$('input[name="toDate"], #toDate, [data-testid="check-out-date"]').catch(() => null);
+    if (!checkOutField) throw new Error("Check-out date field missing. No modification submitted.");
     if (checkOutField) {
       await checkOutField.fill(newCheckOut);
       await randomDelay(300, 600);
     }
   }
 
+  if (newRoomType) {
+    const roomField = p.locator('select[name="roomTypeCode"]');
+    if (await roomField.count() !== 1) throw new Error("Room selection field missing. No modification submitted.");
+    await roomField.selectOption(newRoomType);
+  }
+
   if (specialRequests) {
     const reqField = await p.$('textarea[name="specialRequests"]').catch(() => null);
+    if (!reqField) throw new Error("Special request field missing. No modification submitted.");
     if (reqField) {
       await reqField.fill(specialRequests);
       await randomDelay(200, 500);
     }
   }
 
-  const submitBtn = await p
-    .$('button[type="submit"], [data-testid="modify-submit"], [class*="modify-btn"]')
-    .catch(() => null);
-
-  if (submitBtn) {
+  await assertPageUsable(p);
+  const submitBtn = p.locator('[data-testid="modify-submit"], button[name="modifyReservation"]');
+  if (await submitBtn.count() !== 1 || !await submitBtn.isEnabled()) throw new Error("Unique modification button missing. No modification submitted.");
+  try {
     await submitBtn.click();
-    await p.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 });
-    await randomDelay(1000, 2000);
+    await p.locator('[data-testid="modification-confirmed"]').waitFor({ state: "visible", timeout: 15000 });
+    await assertPageUsable(p);
+  } catch {
+    return { success: false, message: "Modification outcome unknown. Check the reservation before retrying." };
   }
 
-  await saveCookies(ctx);
+  await persistCookies(ctx);
 
   return {
     success: true,
@@ -1201,17 +1038,15 @@ export async function cancelReservation(params: {
   }
 
   // Click cancel confirm button
-  const cancelBtn = await p
-    .waitForSelector(
-      '[data-testid="confirm-cancel"], .l-cancel-confirm, [class*="cancelConfirm"], button[id*="cancel"]',
-      { timeout: 10000 }
-    )
-    .catch(() => null);
-
-  if (cancelBtn) {
+  await assertPageUsable(p);
+  const cancelBtn = p.locator('[data-testid="confirm-cancel"], .l-cancel-confirm');
+  if (await cancelBtn.count() !== 1 || !await cancelBtn.isEnabled()) throw new Error("Unique cancellation button missing. No cancellation submitted.");
+  try {
     await cancelBtn.click();
-    await p.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 });
-    await randomDelay(1000, 2000);
+    await p.locator('[data-testid="cancellation-number"], [class*="cancellationNumber"]').first().waitFor({ state: "visible", timeout: 15000 });
+    await assertPageUsable(p);
+  } catch {
+    return { success: false, message: "Cancellation outcome unknown. Check the reservation before retrying." };
   }
 
   const cancellationNumber = await p
@@ -1221,10 +1056,10 @@ export async function cancelReservation(params: {
     )
     .catch(() => null);
 
-  await saveCookies(ctx);
+  await persistCookies(ctx);
 
   return {
-    success: true,
+    success: Boolean(cancellationNumber),
     cancellationNumber: cancellationNumber || undefined,
     message: cancellationNumber
       ? `Reservation ${confirmationNumber} cancelled. Cancellation number: ${cancellationNumber}`
@@ -1295,7 +1130,7 @@ export async function checkIn(params: {
   const mobileKeyAvailable =
     (await p.$('[class*="mobileKey"], [data-testid="mobile-key"]').catch(() => null)) !== null;
 
-  await saveCookies(ctx);
+  await persistCookies(ctx);
 
   return {
     success: true,
@@ -1398,86 +1233,15 @@ export async function getBonvoyStatus(): Promise<BonvoyStatus> {
     };
   });
 
-  await saveCookies(ctx);
+  await persistCookies(ctx);
   return status;
 });
 }
 
 // ─── Redeem Points ─────────────────────────────────────────────────────────────
 
-export async function redeemPoints(params: {
-  hotelId: string;
-  checkIn: string;
-  checkOut: string;
-  adults?: number;
-  roomCode?: string;
-  confirm?: boolean;
-}): Promise<
-  | { requiresConfirmation: true; preview: object }
-  | { success: boolean; confirmationNumber?: string; pointsUsed?: number; message: string }
-> {
-  return withMutex(browserMutex, async () => {
-  const { hotelId, checkIn, checkOut, adults = 1, roomCode, confirm = false } = params;
-
-  // Get available point rates
-  const rooms = await getRoomOptions({
-    hotelId,
-    checkIn,
-    checkOut,
-    adults,
-    usePoints: true,
-  });
-
-  const pointsRooms = rooms.filter((r) => r.pointsRequired && r.pointsRequired > 0);
-
-  if (!confirm) {
-    return {
-      requiresConfirmation: true,
-      preview: {
-        hotelId,
-        checkIn,
-        checkOut,
-        adults,
-        availablePointsRooms: pointsRooms.slice(0, 5),
-        selectedRoom: roomCode || "Not specified — choose from availablePointsRooms",
-        warning: "THIS WILL REDEEM MARRIOTT BONVOY POINTS. Confirm only if sure.",
-      },
-    };
-  }
-
-  const targetRoom = roomCode
-    ? rooms.find((r) => r.code === roomCode)
-    : pointsRooms[0];
-
-  if (!targetRoom) {
-    return {
-      success: false,
-      message: "No points-eligible room found. Check availability or choose a different room.",
-    };
-  }
-
-  selectedHotelId = hotelId;
-  selectedRoomCode = targetRoom.code;
-  selectedRatePlanCode = targetRoom.ratePlanCode || null;
-
-  const result = await checkout({
-    hotelId,
-    roomCode: targetRoom.code,
-    checkIn,
-    checkOut,
-    adults,
-    confirm: true,
-  });
-
-  if ("success" in result) {
-    return {
-      ...result,
-      pointsUsed: targetRoom.pointsRequired,
-    };
-  }
-
-  return { success: false, message: "Redemption could not be completed." };
-});
+export async function redeemPoints(params: CheckoutRequest) {
+  return withMutex(browserMutex, () => bookingFlow.checkout(params, "redeem_points", true));
 }
 
 // ─── Stay History ──────────────────────────────────────────────────────────────
@@ -1569,7 +1333,7 @@ export async function getStayHistory(params: {
     return { stays, totalNights };
   }, limit);
 
-  await saveCookies(ctx);
+  await persistCookies(ctx);
 
   return {
     stays: history.stays,

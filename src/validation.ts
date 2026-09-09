@@ -6,13 +6,14 @@
  */
 
 import { z } from "zod";
+import { rateOptionFields } from "./rate-options.js";
 
 // ─── Reusable Primitives ────────────────────────────────────────────────────
 
 const dateFormat = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Date must be in YYYY-MM-DD format")
-  .refine((d) => !isNaN(Date.parse(d)), "Invalid date value");
+  .refine((d) => !isNaN(Date.parse(d)) && new Date(d).toISOString().slice(0, 10) === d, "Invalid date value");
 
 const hotelId = z
   .string()
@@ -53,14 +54,17 @@ const nonNegativeInt = (max: number) => z.number().int().min(0).max(max);
 
 export const SearchHotelsSchema = z
   .object({
-    destination: safeString(200),
+    destination: z.string().trim().min(1).max(200),
     checkIn: dateFormat,
     checkOut: dateFormat,
     adults: positiveInt(10).optional(),
     children: nonNegativeInt(10).optional(),
     rooms: positiveInt(9).optional(),
     maxResults: positiveInt(50).optional(),
+    maxPages: positiveInt(10).optional(),
+    ...rateOptionFields,
   })
+  .refine(d => !(d.specialRates && d.rateType), "Provide specialRates or rateType, not both.")
   .refine((d) => d.checkIn < d.checkOut, {
     message: "checkIn must be before checkOut",
   });
@@ -77,16 +81,20 @@ export const RoomOptionsSchema = z
     adults: positiveInt(10).optional(),
     children: nonNegativeInt(10).optional(),
     usePoints: z.boolean().optional(),
+    rooms: positiveInt(9).optional(),
+    ...rateOptionFields,
   })
+  .refine(d => !(d.specialRates && d.rateType), "Provide specialRates or rateType, not both.")
   .refine((d) => d.checkIn < d.checkOut, {
     message: "checkIn must be before checkOut",
   });
 
 export const SelectRoomSchema = z.object({
-  hotelId,
-  roomCode: safeString(30),
+  offerId: z.string().uuid().optional(),
+  hotelId: hotelId.optional(),
+  roomCode: safeString(30).optional(),
   ratePlanCode: safeString(30).optional(),
-});
+}).refine(d => Boolean(d.offerId || (d.hotelId && d.roomCode && d.ratePlanCode)), "Provide offerId, or hotelId, roomCode and ratePlanCode.");
 
 const extraTypes = z.enum([
   "parking",
@@ -103,12 +111,14 @@ export const AddExtrasSchema = z.object({
 
 export const CheckoutSchema = z
   .object({
+    offerId: z.string().uuid().optional(),
     hotelId: hotelId.optional(),
     roomCode: safeString(30).optional(),
-    checkIn: dateFormat,
-    checkOut: dateFormat,
+    checkIn: dateFormat.optional(),
+    checkOut: dateFormat.optional(),
     adults: positiveInt(10).optional(),
     children: nonNegativeInt(10).optional(),
+    rooms: positiveInt(9).optional(),
     firstName: safeString(100).optional(),
     lastName: safeString(100).optional(),
     email: z.string().email("Invalid email format").optional(),
@@ -117,10 +127,12 @@ export const CheckoutSchema = z
       .regex(/^[0-9+\-() ]{7,20}$/, "Invalid phone number format")
       .optional(),
     specialRequests: safeString(1000).optional(),
-    confirm: z.boolean().optional(),
+    governmentEligibilityConfirmed: z.boolean().optional(),
+    specialRateEligibilityConfirmed: z.boolean().optional(),
     confirmationToken: safeString(64).optional(),
   })
-  .refine((d) => d.checkIn < d.checkOut, {
+  .strict()
+  .refine((d) => !d.checkIn || !d.checkOut || d.checkIn < d.checkOut, {
     message: "checkIn must be before checkOut",
   });
 
@@ -134,15 +146,13 @@ export const ModifyReservationSchema = z.object({
   newCheckOut: dateFormat.optional(),
   newRoomType: safeString(30).optional(),
   specialRequests: safeString(1000).optional(),
-  confirm: z.boolean().optional(),
   confirmationToken: safeString(64).optional(),
-});
+}).strict().refine(d => !d.newCheckIn || !d.newCheckOut || d.newCheckIn < d.newCheckOut, "newCheckIn must be before newCheckOut");
 
 export const CancelReservationSchema = z.object({
   confirmationNumber,
-  confirm: z.boolean().optional(),
   confirmationToken: safeString(64).optional(),
-});
+}).strict();
 
 export const CheckInSchema = z.object({
   confirmationNumber,
@@ -150,19 +160,7 @@ export const CheckInSchema = z.object({
   roomPreferences: safeString(500).optional(),
 });
 
-export const RedeemPointsSchema = z
-  .object({
-    hotelId,
-    checkIn: dateFormat,
-    checkOut: dateFormat,
-    adults: positiveInt(10).optional(),
-    roomCode: safeString(30).optional(),
-    confirm: z.boolean().optional(),
-    confirmationToken: safeString(64).optional(),
-  })
-  .refine((d) => d.checkIn < d.checkOut, {
-    message: "checkIn must be before checkOut",
-  });
+export const RedeemPointsSchema = CheckoutSchema;
 
 export const StayHistorySchema = z.object({
   limit: positiveInt(100).optional(),

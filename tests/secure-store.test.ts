@@ -6,7 +6,7 @@
  * fails gracefully.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, afterAll, vi } from "vitest";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -14,11 +14,26 @@ import {
   saveSessionInfo,
   loadSessionInfo,
   clearAuthData,
+  saveCookies,
+  loadCookies,
   type SessionInfo,
 } from "../src/secure-store.js";
 
-const CONFIG_DIR = path.join(os.homedir(), ".striderlabs", "marriott");
+const CONFIG_DIR = vi.hoisted(() => {
+  // Hoisted before importing secure-store: never open real session files.
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const os = require("node:os");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "marriott-storage-test-"));
+  process.env.MARRIOTT_CONFIG_DIR = dir;
+  return dir;
+});
 const SESSION_FILE = path.join(CONFIG_DIR, "session.enc");
+
+afterAll(() => {
+  fs.rmSync(CONFIG_DIR, { recursive: true, force: true });
+  delete process.env.MARRIOTT_CONFIG_DIR;
+});
 
 afterEach(() => {
   clearAuthData();
@@ -120,4 +135,16 @@ describe("clearAuthData", () => {
     clearAuthData();
     expect(fs.existsSync(SESSION_FILE)).toBe(false);
   });
+});
+
+it("restores session cookies and excludes expired cookies", async () => {
+  const base = { domain: ".marriott.com", path: "/", value: "test", httpOnly: true, secure: true, sameSite: "Lax" };
+  await saveCookies({ cookies: async () => [
+    { ...base, name: "session", expires: -1 },
+    { ...base, name: "expired", expires: 1 },
+    { ...base, name: "future", expires: Date.now() / 1000 + 3600 },
+  ] } as any);
+  const addCookies = vi.fn();
+  expect(await loadCookies({ addCookies } as any)).toBe(true);
+  expect(addCookies.mock.calls[0][0].map((c: any) => c.name)).toEqual(["session", "future"]);
 });

@@ -1,5 +1,7 @@
 # Comprehensive Security Review: `@striderlabs/mcp-marriott`
 
+> Historical review of the original implementation. Some referenced files no longer exist and several findings have since been addressed. See README.md and the current tests for implemented behavior and remaining verification limits; this document is not a current security audit.
+
 > **⚠️ CAUTION:** This codebase has **several critical and high-severity security issues** that should be addressed before any production use or public distribution. The most concerning involve credential handling, cookie storage, bot-detection evasion, input validation, and the overall trust model between the MCP client and this server.
 
 ---
