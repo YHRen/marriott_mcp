@@ -1,8 +1,13 @@
 {
   "mcpServers": {
     "marriott": {
-      "command": "node",
-      "args": ["/absolute/path/to/marriott_mcp/dist/index.js"],
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package=github:YHRen/marriott_mcp#v0.1.0",
+        "--",
+        "mcp-marriott"
+      ],
       "env": {
         "MARRIOTT_CDP_URL": "http://127.0.0.1:9222",
         "MARRIOTT_SPECIAL_RATES": "government",

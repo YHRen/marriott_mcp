@@ -15,7 +15,53 @@ Repository: [YHRen/marriott_mcp](https://github.com/YHRen/marriott_mcp)
 
 This project does not promise to bypass Marriott's bot protection. Challenges, access denials, unrecognized pages, and incomplete terms are reported explicitly. It is not affiliated with or endorsed by Marriott International.
 
-## Clone and run
+## Run from GitHub with npx
+
+The recommended deployment keeps two responsibilities separate:
+
+1. The user starts a dedicated Chrome profile with local debugging enabled and signs in to Marriott.
+2. The MCP client starts this server through `npx` and attaches to that profile.
+
+`npx` starts the MCP server; it does **not** start the dedicated Chrome process. Chrome must be running before the first Marriott tool call (starting it before the MCP client is simplest). On macOS:
+
+```bash
+open -na "Google Chrome" --args \
+  --user-data-dir="$HOME/Library/Application Support/Marriott-MCP-Chrome" \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9222 \
+  "https://www.marriott.com/"
+```
+
+Use that window to choose cookie preferences, sign in, and complete MFA. The dedicated profile retains its own cookies between launches. Do not use an everyday browsing profile, and do not expose or forward port `9222`.
+
+Configure the MCP client to install and run the tagged GitHub source:
+
+```json
+{
+  "mcpServers": {
+    "marriott": {
+      "command": "npx",
+      "args": [
+        "--yes",
+        "--package=github:YHRen/marriott_mcp#v0.1.0",
+        "--",
+        "mcp-marriott"
+      ],
+      "env": {
+        "MARRIOTT_CDP_URL": "http://127.0.0.1:9222",
+        "MARRIOTT_SPECIAL_RATES": "government",
+        "MARRIOTT_GOVERNMENT_SCOPE": "federal"
+      }
+    }
+  }
+}
+```
+
+The repository currently is private, so the account running `npx` must have authenticated Git access to `YHRen/marriott_mcp`. A public repository would allow anonymous installation. The first launch can take longer because npm clones the Git repository, installs dependencies, and runs its `prepare` build; subsequent launches use npm's cache. The version tag is pinned so a later change to `main` cannot silently alter the installed server.
+
+This GitHub package-spec workflow is supported by npm. It requires Node.js/npm and Git on the MCP host.
+
+## Clone and run for development
 
 ```bash
 git clone git@github.com:YHRen/marriott_mcp.git
@@ -32,7 +78,7 @@ The browser is visible by default so you can sign in and complete website verifi
 MARRIOTT_BROWSER_CHANNEL=chrome node dist/index.js
 ```
 
-Example MCP client configuration (replace the path with your checkout):
+For a development checkout, an MCP client can run the built local file directly:
 
 ```json
 {

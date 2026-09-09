@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "description": "MCP server for Marriott Hotels — let AI agents search hotels, manage reservations, check in, and redeem Bonvoy points via browser automation",
   "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "SECURITY_REVIEW.md"
+  ],
   "bin": {
     "mcp-marriott": "dist/index.js"
   },
